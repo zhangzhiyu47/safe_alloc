@@ -1,0 +1,322 @@
+/**
+ * @C++智能分配释放空间追踪类safe_alloc说明及其用法
+ *     
+ * @1.说明
+ *     @safe_alloc (后简称为该库)基于C++的STL和GCC 开发的智能分配释放空间追踪
+ *     类，被实现在std命名空间里。
+ *     
+ *     @safe_alloc 只有一个来自本身的对象，即为单例模式。已将构造、析构、拷贝
+ *     构造和重载赋值全部私有化，无法继承。
+ *     
+ *     @同时，若使用C语言风格的malloc等的分配方式申请的safe_alloc大小的堆区空
+ *     间或随便指向不合法的空间，并使用safe_alloc*进行解引用，会抛出this_no_
+ *     true异常，因为内部可以判断this是否为唯一的对象。
+ *     
+ *     @制作人:张志宇
+ *     @(虽源码公开，但不建议随意更改源码! )
+ *     
+ * @2.用法
+ *     @1.复制文件
+ *     @把该文件所在的目录下的source 中的safe_alloc文件复制到要用到该库的文件
+ *     所在的目录下。
+ *     
+ *     @2.定义模式
+ *     @默认的模式为Release 发布模式。运行快，节约空间，但追踪信息没有Debug模
+ *     式完整。
+ *     @在代码中插入#define _DEBUG 进入Debug调试模式(每个文件都要，否则模式功
+ *     能无效！！！ G++可以加上-D_DEBUG 参数自动为每一个文件添加_DEBUG宏，Vi
+ *     sual Studio的Debug32/64自动定义了_DEBUG宏)。运行比Release慢，使用了更
+ *     多的空间，但追踪信息完整。
+ *     @(注意 :这两个模式都基于宏定义完成，即在预编译后模式已经定型)
+ *     
+ *     @3.引入头文件
+ *     @在代码中插入#include "safe_alloc" (也可以直接把这个文件放在对应的GCC的
+ *     include目录(一般是/usr/include/ )，然后无论在哪里，都可以直接引入#incl
+ *     ude <safe_alloc> )
+ *     @(注意 :若前面定义了Debug模式，则一定要引入在 #define _DEBUG的下面 ，否
+ *     则模式定义有可能失效)
+ *     
+ *     @4.初始化
+ *     @在头文件引入后插入全局 代码init_safe_alloc; 来初始化safe_alloc类，切记
+ *     必须且只能初始化一次，多次初始化就会出错(多文件也一样)！！！ ,并定义sa
+ *     fe_alloc类唯一的对象salloc(可以'.'出的都是类内方法)。
+ *     @-----不初始化就使用该类的方法大概会报错undefined symbol: std::salloc&s
+ *     td::safe_alloc::sa(没有定义的变量(标识符):std::salloc和std::safe_alloc
+ *     ::sa)。
+ *     @-----如果多次初始化大概会报错redefinition of 'std::safe_alloc::sa'&'st
+ *     d:salloc'("std::safe_alloc::sa"和"std:salloc"重复定义)。
+ *     
+ *     @5.可以开始使用了
+ *     @一定要仔细阅读该库的用法！
+ */
+#ifndef __INCLUDED_SAFE_ALLOC__
+#define __INCLUDED_SAFE_ALLOC__
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
+#include <iostream>
+#include <cxxabi.h>
+#include <map>
+#include <memory>
+#include <new>
+#include <string>
+#include <utility>
+
+/**
+ * @初始化std::safe_alloc类
+ * @切记必须且只能初始化一次，多次初始化就会出错(多文件也一样)
+ * @并定义std::safe_alloc类唯一的对象std::salloc
+ */
+#define init_safe_alloc \
+    namespace std { \
+        safe_alloc safe_alloc::sa; \
+        safe_alloc& salloc=safe_alloc::get_self(); \
+        /** \
+         * @safe_alloc类唯一的对象salloc(共有的都是类内方法) \
+         */ \
+    }
+
+/**
+ * @用于参数结尾为char* file,size_t line的函数中，直接FileAndLine一个参数即可
+ */
+#define FileAndLine ((char*)__FILE__),(__LINE__)
+
+namespace std
+{
+
+class safe_alloc
+{
+public:
+    /**
+     * @空间信息结构体
+     */
+    struct space_info
+    {
+        size_t num;  /// 申请的数量
+        char * name; /// 申请的变量名
+    #ifdef _DEBUG
+        char * file; /// 申请代码所在的文件名
+        size_t size; /// 申请变量的单个字节数
+        size_t line; /// 申请代码所在的行数
+    #endif 
+    };
+    /**
+     * @自定义空间释放异常类
+     */
+    class bad_free :public exception {
+    private:
+        std::string message; /// 错误信息
+    public:
+        /// 构造函数
+        bad_free(const std::string& msg):message(msg){}
+        /// 虚函数what()的实现，返回错误信息
+        virtual const char* what() const noexcept override {
+            return message.c_str();
+        }
+    };
+    /**
+     * @this指针异常类
+     */
+    class this_not_true :public bad_free {
+    public:
+        /// 构造函数
+        this_not_true() :bad_free(
+            "调用该方法的对象所引用(所指)空间非sale_alloc唯一的对象sale_alloc::sa"
+        ){}
+    };
+    
+private:
+    // 析构及构造
+    safe_alloc()
+    {
+        #ifdef _DEBUG
+            isDebug=true;
+        #else
+            isDebug=false;
+        #endif
+    }
+    safe_alloc(const safe_alloc& cpy){}
+    void operator=(const safe_alloc& cpy){}
+    ~safe_alloc()
+    {
+        if (this!=&sa) return;
+
+        for (map<void*,space_info>::iterator it=all.begin(); it!=all.end(); it++ )
+        {
+            space_info s=it->second;
+            printf("\033[38;5;9m警告!\033[0m空间0x%08x未释放!",(int)(intptr_t)it->first);
+            
+            delete[] (char*)it->first;
+            delete[] it->second.name;                
+            cout << " \033[38;5;40m成功释放\033[0m \033[38;5;214m未调用析构\033[0m";
+            cout << endl;
+            
+            #ifdef _DEBUG
+                cout << "\t文件" << s.file;
+                cout << " 行数" << s.line;
+            #endif
+                cout << " 变量名" << s.name;
+            #ifdef _DEBUG
+                cout << " 单个大小" << s.size << "字节";
+            #endif
+                cout << " 个数" << s.num << endl;    
+        }
+        isDebug=0;
+        all.clear();
+    }
+    
+public:
+    /**
+     * @作用: 申请堆区空间
+     * @参数: size申请的个数
+     *        Debug特有:
+     *           还需补充一个参数FileAndLine(实际上是char* file,size_t line两个参数)
+     * @模板; T所申请空间的类型
+     * @返回: 申请的空间
+     * @异常: this指针非唯一的对象抛出异常std::safe_alloc::this_not_true
+     *        申请失败抛出异常std::bad_alloc
+     */
+    template<class T>
+    T* alloc(size_t size
+        #ifdef _DEBUG
+            ,char* file
+            ,size_t line
+        #endif
+    )
+    {
+        if (this!=&sa) throw this_not_true();
+        if ( size==0 ) throw bad_alloc();
+        
+        const T* space=nullptr;
+        try {
+            space=new T[size]; 
+        } catch (bad_alloc& bad) {
+            throw bad; 
+        }
+
+        space_info in={0};
+        in.num=size;
+        string str;
+        try {
+            int status = -4;
+            std::unique_ptr<char[], void(*)(void*)> res {
+                abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, &status),
+                std::free
+            };
+            str=(status == 0)?res.get():typeid(T).name();
+
+            in.name=new char[strlen(str.c_str())+1];
+        } catch (bad_alloc& bad) {
+            delete[] space;
+            throw bad;
+        }
+        strcpy(in.name,str.c_str());
+        
+        #ifdef _DEBUG
+            in.file=file;
+            in.line=line;
+            in.size=sizeof(T);
+        #endif
+
+        pair<map<void*,space_info>::iterator,bool> ret=all.insert(std::make_pair((void*)space,in));
+        if ( ret.second==false )
+        {
+            delete[] space;
+            delete[] in.name;
+            throw bad_alloc();
+        }
+        return (T*)space;
+    }
+    /**
+     * @作用: 释放堆区空间
+     * @参数: space想要释放的空间
+     * @模板: T同上
+     * @返回: 无返回值
+     * @异常: this指针非唯一的对象抛出异常std::safe_alloc::this_not_true
+     *        释放失败抛出异常std::safe_alloc::bad_free
+     */
+    template<class T>
+    void free(T* space)
+    {
+        if (this!=&sa) throw this_not_true();
+
+        map<void*,space_info>::iterator it=all.find(space);
+        if ( it==all.end() ) throw bad_free("没有申请该空间");
+
+        int status = -4;
+        std::unique_ptr<char[], void(*)(void*)> res {
+            abi::__cxa_demangle(typeid(T).name(), nullptr, nullptr, &status),
+            std::free
+        };
+        string str=(status == 0)?res.get():typeid(T).name();
+        string name=it->second.name;
+        if ( str!=name ) 
+            throw bad_free("所给的类型与原类型不符");
+
+        delete[] (T*)it->first;
+        delete[] it->second.name;
+
+        all.erase(it);
+    }
+
+
+    /**
+     * @作用: 获取单例模式的唯一对象
+     * @无参
+     * @返回: safe_alloc&
+     */
+    static safe_alloc& get_self(void)
+    {
+        return sa;
+    }
+    /**
+     * @作用: 查找space空间的信息
+     * @参数: space查找空间
+     * @返回: std::pair<bool,std::safe_alloc::space_info>，bool为查找是否成功
+     * @异常: this指针非唯一的对象抛出异常std::safe_alloc::this_not_true
+     */
+    pair<bool,space_info> information(void *space) const
+    {
+        if (this!=&sa) throw this_not_true();
+        map<void*,space_info>::const_iterator it=all.find(space);
+        if (it==all.end())
+        {
+            return pair<bool,space_info>(false,space_info());;
+        }
+        return pair<bool,space_info>(true,it->second);
+    }
+    /**
+     * @作用: 获取未释放的申请次数
+     * @异常: this指针非唯一的对象抛出异常std::safe_alloc::this_not_true
+     */
+    size_t number(void) const
+    {
+        if (this!=&sa) throw this_not_true();
+        return all.size();
+    }
+    /**
+     * @作用: 判断是否为调试模式
+     * @无参
+     * @返回: 返回true即为调试模式，返回false即为发布模式
+     * @异常: this指针非唯一的对象抛出异常std::safe_alloc::this_not_true
+     */
+    bool is_debug(void) const
+    {
+        if (this!=&sa) throw this_not_true();
+        return isDebug;
+    }
+    
+private:
+    static safe_alloc sa;         /// 单例模式的唯一对象
+    map<void*,space_info> all;    /// 储存申请空间的信息
+    bool isDebug;                 /// 判断是否为调试模式
+    
+};
+
+extern safe_alloc& salloc;
+}
+
+#endif
