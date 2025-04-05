@@ -158,7 +158,7 @@ g++ -D_DEBUG your_program.cpp -o your_program
 
 ## 5. 示例代码
 
-[\[try/main.c\]](try/main.c)
+[\[try/main.cpp\]](try/main.cpp)
 
 ## 6. 异常处理
 
